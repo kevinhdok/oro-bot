@@ -1,38 +1,41 @@
 """
-Backtest de la estrategia del bot XAUUSD (EMA 9/21 + RSI + ATR).
-Usa los últimos ~60 días de velas de 15 min y envía el resultado a Telegram.
-Se ejecuta manualmente desde GitHub Actions.
+Búsqueda de estrategia para XAUUSD (oro), velas de 1 hora, ~2 años de datos.
+Prueba varias estrategias con una regla estricta:
+  - Se elige la mejor configuración con los datos de ENTRENAMIENTO (primer 60%).
+  - Se evalúa en datos que nunca vio (último 40%).
+Solo una estrategia que gane en ambos tramos merece usarse.
+Se ejecuta manualmente desde GitHub Actions y envía el resultado a Telegram.
 """
 import os
-import requests
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
 SYMBOL = "GC=F"
-INTERVAL = "15m"
-PERIOD = "60d"       # máximo que da Yahoo para velas de 15 min
+INTERVAL = "1h"
+PERIOD = "730d"        # máximo que da Yahoo para velas de 1 hora
+COST = 0.5             # spread + deslizamiento por operación, en puntos de precio
+MAX_BARS = 48          # una operación se cierra a las 48 h si no toca TP ni SL
+TRAIN_FRAC = 0.6
+MIN_TRAIN = 30         # mínimo de operaciones para considerar una configuración
+MIN_TEST = 20
+PF_OK = 1.15           # factor de beneficio mínimo para considerarla válida
+WARM = 250             # velas iniciales descartadas (para que existan los indicadores)
 
-# Mismos ajustes que el bot
-TP_STEP = 0.5        # distancia entre TPs (en ATR)
-N_TPS = 5
-SL_MULT = 1.5        # stop loss (en ATR)
-
-SPREAD = 0.4         # costo supuesto por operación, en puntos de precio
-MAX_BARS = 96        # una operación se cierra a las 24 h si no toca TP ni SL
-
-COMBOS = [(1, 1), (1, 2), (1.5, 1.5), (1.5, 3), (2, 2), (2, 4), (3, 3)]  # (SL, TP) en ATR
+EXITS = [(1.5, 1.5), (1.5, 3), (2, 2), (2, 4), (3, 3), (3, 6)]   # (SL, TP) en múltiplos de ATR
 
 
 def send(text: str):
-    requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text},
-        timeout=20,
-    )
+    for i in range(0, len(text), 3900):
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text[i:i + 3900]},
+            timeout=20,
+        )
 
 
 def rsi(close: pd.Series, n: int = 14) -> pd.Series:
@@ -42,112 +45,187 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     return 100 - 100 / (1 + gain / loss)
 
 
-def exit_price(side, sl, tp, highs, lows, last_close):
-    """Recorre las velas siguientes. Si en una vela toca SL y TP, asume SL (caso conservador)."""
-    for h, l in zip(highs, lows):
-        if side == 1:
-            if l <= sl:
-                return sl
-            if h >= tp:
-                return tp
-        else:
-            if h >= sl:
-                return sl
-            if l <= tp:
-                return tp
-    return last_close
+def shift(a, k=1):
+    out = np.full_like(a, np.nan, dtype=float)
+    out[k:] = a[:-k]
+    return out
 
 
-def stats(pnls):
-    p = np.array(pnls, dtype=float)
-    wins = p[p > 0].sum()
-    losses = -p[p < 0].sum()
-    pf = wins / losses if losses > 0 else float("inf")
-    return (p > 0).mean() * 100, p.sum(), pf
+def edge(x):
+    """Solo la primera vela en que se cumple la condición."""
+    prev = np.r_[False, x[:-1]]
+    return x & ~prev
 
 
-def fmt_pf(pf):
-    return "∞" if pf == float("inf") else f"{pf:.2f}"
+# ---------- Estrategias: devuelven +1 (compra), -1 (venta) o 0 por vela ----------
+def sig_pullback(I, lvl):
+    up = (I["c"] > I["ema200"]) & (I["ema50"] > I["ema200"])
+    dn = (I["c"] < I["ema200"]) & (I["ema50"] < I["ema200"])
+    r, rp = I["rsi"], shift(I["rsi"])
+    buy = up & (rp > lvl) & (r <= lvl)
+    sell = dn & (rp < 100 - lvl) & (r >= 100 - lvl)
+    return buy.astype(int) - sell.astype(int)
+
+
+def sig_donchian(I, n):
+    hh = shift(pd.Series(I["h"]).rolling(n).max().to_numpy())
+    ll = shift(pd.Series(I["l"]).rolling(n).min().to_numpy())
+    buy = edge((I["c"] > hh) & (I["c"] > I["ema200"]))
+    sell = edge((I["c"] < ll) & (I["c"] < I["ema200"]))
+    return buy.astype(int) - sell.astype(int)
+
+
+def sig_cross(I, p):
+    f, s = p
+    cs = pd.Series(I["c"])
+    ef = cs.ewm(span=f, adjust=False).mean().to_numpy()
+    es = cs.ewm(span=s, adjust=False).mean().to_numpy()
+    up = (ef > es) & (shift(ef) <= shift(es)) & (I["c"] > I["ema200"])
+    dn = (ef < es) & (shift(ef) >= shift(es)) & (I["c"] < I["ema200"])
+    return up.astype(int) - dn.astype(int)
+
+
+def sig_boll(I, k):
+    cs = pd.Series(I["c"])
+    m = cs.rolling(20).mean().to_numpy()
+    sd = cs.rolling(20).std().to_numpy()
+    buy = edge(I["c"] < m - k * sd)
+    sell = edge(I["c"] > m + k * sd)
+    return buy.astype(int) - sell.astype(int)
+
+
+STRATS = [
+    ("Tendencia + retroceso RSI", sig_pullback, [30, 35, 40], lambda p: f"RSI {p}"),
+    ("Ruptura de rango + tendencia", sig_donchian, [20, 40, 55], lambda p: f"{p} velas"),
+    ("Cruce de EMAs + tendencia", sig_cross, [(9, 21), (12, 26), (20, 50)], lambda p: f"EMA {p[0]}/{p[1]}"),
+    ("Reversión Bollinger", sig_boll, [2, 2.5], lambda p: f"{p} desv."),
+]
+
+
+# ---------- Simulación ----------
+def simulate(I, sig, sl_m, tp_m, lo, hi):
+    """Una operación a la vez. Entra en la apertura de la vela siguiente a la señal.
+    Si en una vela toca SL y TP, asume SL (caso conservador)."""
+    n = len(I["c"])
+    trades, busy = [], -1
+    for i in range(lo, hi):
+        s = sig[i]
+        if s == 0 or i < busy or i + 1 >= n:
+            continue
+        a = I["atr"][i]
+        if not np.isfinite(a) or a <= 0:
+            continue
+        entry = I["o"][i + 1]
+        sl = entry - s * sl_m * a
+        tp = entry + s * tp_m * a
+        end = min(n, i + 1 + MAX_BARS)
+        ex, k_exit = None, end - 1
+        for k in range(i + 1, end):
+            hk, lk = I["h"][k], I["l"][k]
+            if s == 1:
+                if lk <= sl:
+                    ex, k_exit = sl, k
+                    break
+                if hk >= tp:
+                    ex, k_exit = tp, k
+                    break
+            else:
+                if hk >= sl:
+                    ex, k_exit = sl, k
+                    break
+                if lk <= tp:
+                    ex, k_exit = tp, k
+                    break
+        if ex is None:
+            ex = I["c"][end - 1]
+        trades.append((s, s * (ex - entry) - COST))
+        busy = k_exit + 1
+    return trades
+
+
+def stats(trades):
+    if not trades:
+        return dict(n=0, pf=0.0, total=0.0, wr=0.0, buy=0.0, sell=0.0)
+    p = np.array([t[1] for t in trades])
+    sd = np.array([t[0] for t in trades])
+    wins, losses = p[p > 0].sum(), -p[p < 0].sum()
+    pf = wins / losses if losses > 0 else 99.0
+    return dict(n=len(p), pf=pf, total=p.sum(), wr=(p > 0).mean() * 100,
+                buy=p[sd == 1].sum(), sell=p[sd == -1].sum())
 
 
 def main():
-    df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL,
-                     progress=False, auto_adjust=True)
-    if df.empty or len(df) < 200:
-        send("Backtest: no pude obtener suficientes datos de Yahoo Finance.")
+    df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
+    if df.empty or len(df) < 3000:
+        send("Búsqueda de estrategia: no pude obtener suficientes datos de Yahoo Finance.")
         return
-    df = df.iloc[:-1]  # quitar vela en formación
+    df = df.iloc[:-1]
 
-    close_s = df["Close"].squeeze()
-    close = close_s.to_numpy(dtype=float)
-    high = df["High"].squeeze().to_numpy(dtype=float)
-    low = df["Low"].squeeze().to_numpy(dtype=float)
+    o = df["Open"].squeeze().to_numpy(dtype=float)
+    h = df["High"].squeeze().to_numpy(dtype=float)
+    l = df["Low"].squeeze().to_numpy(dtype=float)
+    cser = df["Close"].squeeze().astype(float)
+    c = cser.to_numpy()
+    pc = cser.shift(1)
+    tr = pd.concat([df["High"].squeeze() - df["Low"].squeeze(),
+                    (df["High"].squeeze() - pc).abs(),
+                    (df["Low"].squeeze() - pc).abs()], axis=1).max(axis=1)
+    I = dict(
+        o=o, h=h, l=l, c=c,
+        atr=tr.rolling(14).mean().to_numpy(),
+        ema50=cser.ewm(span=50, adjust=False).mean().to_numpy(),
+        ema200=cser.ewm(span=200, adjust=False).mean().to_numpy(),
+        rsi=rsi(cser).to_numpy(),
+    )
 
-    fast = close_s.ewm(span=9, adjust=False).mean().to_numpy()
-    slow = close_s.ewm(span=21, adjust=False).mean().to_numpy()
-    r = rsi(close_s).to_numpy()
-    atr = (df["High"].squeeze() - df["Low"].squeeze()).rolling(14).mean().to_numpy()
-
-    signals = []
-    for i in range(30, len(df) - MAX_BARS):
-        up = fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]
-        dn = fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]
-        if up and r[i] < 70:
-            signals.append((i, 1))
-        elif dn and r[i] > 30:
-            signals.append((i, -1))
-
-    if not signals:
-        send("Backtest: la estrategia no generó señales en el período.")
-        return
-
-    def run(sl_mult, tp_mult):
-        pnls = []
-        for i, side in signals:
-            entry, a = close[i], atr[i]
-            sl = entry - side * sl_mult * a
-            tp = entry + side * tp_mult * a
-            w = slice(i + 1, i + 1 + MAX_BARS)
-            ex = exit_price(side, sl, tp, high[w], low[w], close[i + MAX_BARS])
-            pnls.append(side * (ex - entry) - SPREAD)
-        return pnls
-
-    n_buy = sum(1 for _, s in signals if s == 1)
-    days = (df.index[-1] - df.index[0]).days
+    n = len(c)
+    split = WARM + int((n - WARM) * TRAIN_FRAC)
+    years = (df.index[-1] - df.index[0]).days / 365
+    move = (c[-1] / c[split] - 1) * 100
 
     lines = [
-        "📊 BACKTEST XAUUSD (oro, velas 15m)",
-        f"Período: últimos {days} días | Señales: {len(signals)} ({n_buy} BUY / {len(signals) - n_buy} SELL)",
-        f"Costo supuesto por operación: {SPREAD} pts. 1 pt = $1 con 0.01 lote.",
+        f"🔬 BÚSQUEDA DE ESTRATEGIA XAUUSD (velas 1h, {years:.1f} años)",
+        "Se elige la mejor configuración con datos de entrenamiento y se evalúa en datos nuevos que nunca vio.",
+        f"Costo supuesto por operación: {COST} pts. 1 pt = $1 con 0.01 lote.",
+        f"En el tramo de prueba el oro cambió {move:+.0f}%: si solo ganan las compras, puede ser la tendencia y no la estrategia.",
         "",
-        f"FORMATO ACTUAL DEL BOT (SL {SL_MULT}×ATR, TPs cada {TP_STEP}×ATR)",
-        "Resultado si cierras todo en cada TP:",
     ]
-    legs = []
-    for k in range(1, N_TPS + 1):
-        p = run(SL_MULT, TP_STEP * k)
-        legs.append(p)
-        wr, tot, pf = stats(p)
-        lines.append(f"TP{k}: aciertan {wr:.0f}% | total {tot:+.0f} pts | PF {fmt_pf(pf)}")
 
-    split = np.mean(np.array(legs), axis=0)
-    wr, tot, pf = stats(split)
-    lines += [
-        "",
-        f"Repartiendo en {N_TPS} partes (una por TP): total {tot:+.0f} pts | PF {fmt_pf(pf)}",
-        f"Promedio por señal: {split.mean():+.2f} pts",
-        "",
-        "OTRAS COMBINACIONES (una sola salida)",
-    ]
-    for sl_m, tp_m in COMBOS:
-        wr, tot, pf = stats(run(sl_m, tp_m))
-        lines.append(f"SL {sl_m}× / TP {tp_m}×: aciertan {wr:.0f}% | total {tot:+.0f} pts | PF {fmt_pf(pf)}")
+    valid = []
+    with np.errstate(invalid="ignore"):
+        for name, fn, params, label in STRATS:
+            best = None
+            for p in params:
+                sig = fn(I, p)
+                for sl_m, tp_m in EXITS:
+                    tr_t = stats(simulate(I, sig, sl_m, tp_m, WARM, split))
+                    if tr_t["n"] < MIN_TRAIN or tr_t["total"] <= 0:
+                        continue
+                    if best is None or tr_t["pf"] > best["train"]["pf"]:
+                        best = dict(p=p, sl=sl_m, tp=tp_m, train=tr_t, sig=sig)
+            if best is None:
+                lines += [f"{name}: ninguna configuración ganó ni en entrenamiento.", ""]
+                continue
+            te = stats(simulate(I, best["sig"], best["sl"], best["tp"], split, n - 1))
+            ok = (te["n"] >= MIN_TEST and te["pf"] >= PF_OK
+                  and best["train"]["pf"] >= PF_OK and te["total"] > 0)
+            if ok:
+                valid.append((name, label(best["p"]), best["sl"], best["tp"], te))
+            tr_t = best["train"]
+            lines += [
+                f"{'✅' if ok else '❌'} {name} ({label(best['p'])}, SL {best['sl']}×ATR / TP {best['tp']}×ATR)",
+                f"  Entrenamiento: {tr_t['n']} ops | aciertan {tr_t['wr']:.0f}% | {tr_t['total']:+.0f} pts | PF {tr_t['pf']:.2f}",
+                f"  Prueba (datos nuevos): {te['n']} ops | aciertan {te['wr']:.0f}% | {te['total']:+.0f} pts | PF {te['pf']:.2f}",
+                f"  Prueba por lado: BUY {te['buy']:+.0f} pts / SELL {te['sell']:+.0f} pts",
+                "",
+            ]
 
-    lines += [
-        "",
-        "PF (factor de beneficio) mayor a 1 = ganó dinero; menor a 1 = perdió.",
-        "Ojo: son solo ~60 días, muestra pequeña. No garantiza resultados futuros.",
-    ]
+    if valid:
+        lines.append(f"VEREDICTO: {len(valid)} estrategia(s) ganaron en entrenamiento Y en datos nuevos (PF ≥ {PF_OK}).")
+        lines.append("Ojo: al probar tantas combinaciones, alguna puede pasar solo por suerte. 2 años es muestra limitada: primero demo.")
+    else:
+        lines.append("VEREDICTO: ninguna estrategia ganó de forma consistente en datos nuevos. No conviene operar dinero real con estas reglas.")
+    lines.append("PF = ganado ÷ perdido. Mayor a 1 gana; menor a 1 pierde.")
     send("\n".join(lines))
 
 
