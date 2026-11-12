@@ -1,5 +1,6 @@
 """
 Revisa XAUUSD una vez y envía la señal a Telegram si hay cruce.
+Formato estilo canal: entrada, 5 TPs y SL.
 Pensado para correr cada 15 min en GitHub Actions (gratis).
 """
 import os
@@ -13,13 +14,18 @@ TEST = os.environ.get("TEST") == "1"
 
 SYMBOL = "GC=F"
 INTERVAL = "15m"
-ATR_SL, ATR_TP = 1.5, 3.0
+
+# Ajustes de la señal (en múltiplos del ATR, la volatilidad promedio)
+TP_STEP = 0.5    # distancia entre cada TP
+N_TPS = 5        # cantidad de TPs
+SL_MULT = 1.5    # distancia del stop loss
+ZONE_MULT = 0.5  # ancho de la zona de entrada
 
 
 def send(text: str):
     requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
+        data={"chat_id": CHAT_ID, "text": text},
         timeout=20,
     )
 
@@ -29,6 +35,17 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     gain = d.clip(lower=0).rolling(n).mean()
     loss = (-d.clip(upper=0)).rolling(n).mean()
     return 100 - 100 / (1 + gain / loss)
+
+
+def build_message(side: str, price: float, atr: float) -> str:
+    sign = 1 if side == "BUY" else -1
+    zone = price - sign * ZONE_MULT * atr
+    tps = [price + sign * TP_STEP * atr * k for k in range(1, N_TPS + 1)]
+    sl = price - sign * SL_MULT * atr
+    lines = [f"⭐ GOLD {side} NOW {round(price)}// {round(zone)}", ""]
+    lines += [f"✅ TP {round(tp)}" for tp in tps]
+    lines += ["", f"👀 SL {round(sl)}", "", "⚠️ No es asesoría financiera."]
+    return "\n".join(lines)
 
 
 def main():
@@ -53,19 +70,13 @@ def main():
     up = fast.iloc[-2] <= slow.iloc[-2] and fast.iloc[-1] > slow.iloc[-1]
     dn = fast.iloc[-2] >= slow.iloc[-2] and fast.iloc[-1] < slow.iloc[-1]
 
-    side = None
     if up and r < 70:
-        side, sl, tp = "BUY", price - ATR_SL * atr, price + ATR_TP * atr
+        send(build_message("BUY", price, atr))
     elif dn and r > 30:
-        side, sl, tp = "SELL", price + ATR_SL * atr, price - ATR_TP * atr
-
-    if side:
-        icon = "🟢" if side == "BUY" else "🔴"
-        send(f"{icon} *{side} XAUUSD*\nEntrada: {price:.2f}\nSL: {sl:.2f}\n"
-             f"TP: {tp:.2f}\nRSI: {r:.1f} | TF: {INTERVAL}\n\n"
-             f"⚠️ No es asesoría financiera.")
+        send(build_message("SELL", price, atr))
     elif TEST:
         send(f"✅ Bot funcionando. Sin señal ahora.\nPrecio: {price:.2f} | RSI: {r:.1f}")
+        send("Así se verá una señal de ejemplo:\n\n" + build_message("BUY", price, atr))
 
 
 if __name__ == "__main__":
