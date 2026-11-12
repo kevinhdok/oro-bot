@@ -1,0 +1,21 @@
+name: XAUUSD signals
+
+on:
+  schedule:
+    - cron: "*/15 * * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas requests
+      - run: python bot_signal.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          TEST: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
